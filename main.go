@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/bytehi/resp"
 )
@@ -57,7 +58,7 @@ func startProxy(ip, port string) (string, func()) {
 			clientConn, err := listener.Accept()
 			if err != nil {
 				log.Printf("Error accepting connection: %v", err)
-				continue
+				break
 			}
 
 			serverConn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", ip, port))
@@ -76,7 +77,7 @@ func startProxy(ip, port string) (string, func()) {
 }
 
 func execRedisCli(args []string) {
-	fmt.Println("call redis-cli, args:", args)
+	log.Println("call redis-cli, args:", args)
 	cmd := exec.Command("redis-cli", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -97,13 +98,13 @@ func forward(src io.ReadCloser, dst io.WriteCloser) {
 	for {
 		msg, err := resp.Parse(reader)
 		if err != nil {
-			log.Printf("Error parse resp: %v", err)
+			log.Printf("Error parse resp: %v\n", err)
 			break
 		}
-		fmt.Println(msg)
+		//fmt.Println(msg)
 		bs, err := msg.Marshal()
 		if err != nil {
-			log.Printf("Error marshal resp: %v", err)
+			log.Printf("Error marshal resp: %v\n", err)
 			break
 		}
 		_, err = dst.Write(bs)
@@ -123,19 +124,19 @@ func forwardOneByOne(src, dst net.Conn, reqHook ReqHookFunc, ackHook AckHookFunc
 	for {
 		msg, err := resp.Parse(srcReader)
 		if err != nil {
-			log.Printf("Error parse resp: %v", err)
+			log.Printf("Error parse resp: %v\n", err)
 			break
 		}
 
 		msg = reqHook(msg)
 		bs, err := msg.Marshal()
 		if err != nil {
-			log.Printf("Error marshal resp: %v", err)
+			log.Printf("Error marshal resp: %v\n", err)
 			break
 		}
 		_, err = dst.Write(bs)
 		if err != nil {
-			log.Printf("Error forwarding data: %v", err)
+			log.Printf("Error forwarding data: %v\n", err)
 			break
 		}
 
@@ -147,12 +148,12 @@ func forwardOneByOne(src, dst net.Conn, reqHook ReqHookFunc, ackHook AckHookFunc
 		response = ackHook(msg, response)
 		bs, err = response.Marshal()
 		if err != nil {
-			log.Printf("Error marshal response: %v", err)
+			log.Printf("Error marshal response: %v\n", err)
 			break
 		}
 		_, err = src.Write(bs)
 		if err != nil {
-			log.Printf("Error forwarding response: %v", err)
+			log.Printf("Error forwarding response: %v\n", err)
 			break
 		}
 	}
@@ -162,10 +163,28 @@ type ReqHookFunc func(req *resp.RESP) *resp.RESP
 type AckHookFunc func(req, rsp *resp.RESP) *resp.RESP
 
 func reqHookFunc(req *resp.RESP) *resp.RESP {
-	fmt.Println("req", req)
+	log.Println("req", req)
 	return req
 }
 func ackHookFunc(req, ack *resp.RESP) *resp.RESP {
-	fmt.Println("ack", ack)
+	log.Println("ack", ack)
+	reqArray := reqToArray(req)
+	if strings.ToUpper(reqArray[0]) == "PING" {
+		ack = adjustPingAck(ack)
+	}
+	return ack
+}
+
+func reqToArray(req *resp.RESP) []string {
+	members := req.Value.([]*resp.RESP)
+	array := make([]string, 0, len(members))
+	for _, member := range members {
+		array = append(array, member.Value.(string))
+	}
+	return array
+}
+
+func adjustPingAck(ack *resp.RESP) *resp.RESP {
+	ack.Value = "received ping ack:" + ack.Value.(string)
 	return ack
 }
