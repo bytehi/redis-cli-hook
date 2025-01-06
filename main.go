@@ -2,16 +2,18 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/bytehi/resp"
 )
+
+var logger = log.New(os.Stdout, "", log.LstdFlags)
 
 func parse() (ip, port string, leftArgs []string) {
 	ip = "127.0.0.1"
@@ -40,24 +42,26 @@ func main() {
 	execRedisCli(leftArgs)
 }
 
-//start proxy to connect redis, and return proxy local listen port
+// start proxy to connect redis, and return proxy local listen port
 func startProxy(ip, port string) (string, func()) {
 	//random listen local port
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
-		log.Fatalf("Error listening: %v", err)
+		logger.Fatalf("Error listening: %v", err)
 	}
 	_, proxyPort, err := net.SplitHostPort(listener.Addr().String())
 	if err != nil {
-		log.Fatalf("Error parsing address:", err.Error())
+		logger.Fatalf("Error parsing address:%s", err.Error())
 	}
-	log.Println("Server started, listening on:", listener.Addr().String(), proxyPort)
+	logger.Printf("Server started, listening on: %s, proxyPort: %s", listener.Addr().String(), proxyPort)
 
 	go func() {
 		for {
 			clientConn, err := listener.Accept()
 			if err != nil {
-				log.Printf("Error accepting connection: %v", err)
+				if !errors.Is(err, net.ErrClosed) {
+					logger.Printf("Error accepting connection: %v", err)
+				}
 				break
 			}
 
@@ -68,9 +72,7 @@ func startProxy(ip, port string) (string, func()) {
 				continue
 			}
 
-			//go forward(clientConn, serverConn)
-			//go forward(serverConn, clientConn)
-			go forwardOneByOne(clientConn, serverConn, reqHookFunc, ackHookFunc)
+			go forwardOneByOne(clientConn, serverConn)
 		}
 	}()
 	return proxyPort, func() { listener.Close() }
@@ -89,102 +91,82 @@ func execRedisCli(args []string) {
 	cmd.Wait()
 }
 
-//unused
-func forward(src io.ReadCloser, dst io.WriteCloser) {
-	defer src.Close()
-	defer dst.Close()
-
-	reader := bufio.NewReader(src)
-	for {
-		msg, err := resp.Parse(reader)
-		if err != nil {
-			log.Printf("Error parse resp: %v\n", err)
-			break
-		}
-		//fmt.Println(msg)
-		bs, err := msg.Marshal()
-		if err != nil {
-			log.Printf("Error marshal resp: %v\n", err)
-			break
-		}
-		_, err = dst.Write(bs)
-		if err != nil {
-			log.Printf("Error forwarding data: %v", err)
-			break
-		}
-	}
-}
-
-func forwardOneByOne(src, dst net.Conn, reqHook ReqHookFunc, ackHook AckHookFunc) {
+func forwardOneByOne(src, dst net.Conn) {
 	defer src.Close()
 	defer dst.Close()
 
 	srcReader := bufio.NewReader(src)
 	dstReader := bufio.NewReader(dst)
 	for {
-		msg, err := resp.Parse(srcReader)
+		req, err := resp.Parse(srcReader)
 		if err != nil {
-			log.Printf("Error parse resp: %v\n", err)
-			break
+			if err == io.EOF {
+				break
+			}
+			logger.Fatalf("Error parse resp: %v\n", err)
+		}
+		cmd, args := toRequestCmd(req)
+		for _, plugin := range Plugins {
+			cmd, args, err = plugin.BeforeCommand(cmd, args)
+			if err != nil {
+				logger.Fatalf("Error before command: %v\n", err)
+			}
 		}
 
-		msg = reqHook(msg)
-		bs, err := msg.Marshal()
-		if err != nil {
-			log.Printf("Error marshal resp: %v\n", err)
-			break
+		members := make([]*resp.RESP, 0, len(args)+1)
+		members = append(members, resp.NewBulkString(cmd))
+		for _, arg := range args {
+			members = append(members, resp.NewBulkString(arg))
 		}
+		req = resp.NewArray(members)
+		bs, err := req.Marshal()
+		if err != nil {
+			logger.Fatalf("Error marshal resp: %v\n", err)
+		}
+
 		_, err = dst.Write(bs)
 		if err != nil {
-			log.Printf("Error forwarding data: %v\n", err)
-			break
+			logger.Fatalf("Error forwarding data: %v\n", err)
 		}
 
-		response, err := resp.Parse(dstReader)
+		ack, err := resp.Parse(dstReader)
 		if err != nil {
-			log.Printf("Error parse response: %v", err)
-			break
+			if err == io.EOF {
+				break
+			}
+			logger.Fatalf("Error parse response: %v", err)
 		}
-		response = ackHook(msg, response)
-		bs, err = response.Marshal()
+
+		for _, plugin := range Plugins {
+			ack, err = plugin.AfterCommand(cmd, args, ack)
+			if err != nil {
+				logger.Fatalf("Error after command: %v\n", err)
+			}
+		}
+		bs, err = ack.Marshal()
 		if err != nil {
-			log.Printf("Error marshal response: %v\n", err)
-			break
+			logger.Fatalf("Error marshal response: %v\n", err)
 		}
+
 		_, err = src.Write(bs)
 		if err != nil {
-			log.Printf("Error forwarding response: %v\n", err)
-			break
+			logger.Fatalf("Error forwarding response: %v\n", err)
 		}
 	}
 }
 
-type ReqHookFunc func(req *resp.RESP) *resp.RESP
-type AckHookFunc func(req, rsp *resp.RESP) *resp.RESP
-
-func reqHookFunc(req *resp.RESP) *resp.RESP {
-	log.Println("req", req)
-	return req
-}
-func ackHookFunc(req, ack *resp.RESP) *resp.RESP {
-	log.Println("ack", ack)
-	reqArray := reqToArray(req)
-	if strings.ToUpper(reqArray[0]) == "PING" {
-		ack = adjustPingAck(ack)
+func toRequestCmd(req *resp.RESP) (string, []string) {
+	if req.Type != resp.Array {
+		logger.Fatalf("request: %s not array\n", req)
 	}
-	return ack
-}
-
-func reqToArray(req *resp.RESP) []string {
 	members := req.Value.([]*resp.RESP)
-	array := make([]string, 0, len(members))
-	for _, member := range members {
-		array = append(array, member.Value.(string))
+	if len(members) == 0 {
+		logger.Fatalf("request: %s not array\n", req)
 	}
-	return array
-}
-
-func adjustPingAck(ack *resp.RESP) *resp.RESP {
-	ack.Value = "received ping ack:" + ack.Value.(string)
-	return ack
+	cmd := members[0].Value.(string)
+	args := make([]string, 0, len(members)-1)
+	for _, member := range members[1:] {
+		args = append(args, member.Value.(string))
+	}
+	return cmd, args
 }
